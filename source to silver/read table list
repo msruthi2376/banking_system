@@ -1,0 +1,114 @@
+# Databricks notebook source
+
+import json
+
+# ==========================================
+# 1️⃣ Create Widget
+# ==========================================
+
+dbutils.widgets.text("source_system", "")
+
+source_system = dbutils.widgets.get("source_system").strip()
+
+print(f"Source System Passed: '{source_system}'")
+
+if not source_system:
+    raise ValueError("source_system widget cannot be empty")
+
+
+# ==========================================
+# 2️⃣ Read Metadata Tables
+# ==========================================
+
+tables_df = spark.table("banking.metadata.tables")
+
+# For silver-to-gold processing, filter tables that have silver layer data
+if source_system.lower() == 'silver':
+    filtered_df = (
+        tables_df
+        .filter(
+            (tables_df.active_flag == True) &
+            (tables_df.silver_schema.isNotNull())
+        )
+        .orderBy("load_order")
+    )
+else:
+    # For source system filtering (bronze/silver ingestion)
+    filtered_df = (
+        tables_df
+        .filter(
+            (tables_df.active_flag == True) &
+            (tables_df.source_system.isNotNull())
+        )
+        .filter(f"lower(source_system) = lower('{source_system}')")
+        .orderBy("load_order")
+    )
+
+print("Matching Records Count:", filtered_df.count())
+
+display(filtered_df)
+
+if filtered_df.count() == 0:
+    if source_system.lower() == 'silver':
+        raise Exception(
+            f"No active tables found with silver layer data (silver_schema is null or no active records)"
+        )
+    else:
+        raise Exception(
+            f"No active tables found for source_system = '{source_system}'"
+        )
+
+
+# ==========================================
+# 3️⃣ Convert to List of Dictionaries
+# ==========================================
+
+rows = filtered_df.collect()
+
+tables_list = []
+
+for row in rows:
+    tables_list.append({
+        "table_id": str(row["table_id"]) if row["table_id"] is not None else "",
+        "table_name": str(row["table_name"]) if row["table_name"] is not None else "",
+        "source_system": str(row["source_system"]) if row["source_system"] is not None else "",
+        "source_schema": str(row["source_schema"]) if row["source_schema"] is not None else "",
+        "source_table": str(row["source_table"]) if row["source_table"] is not None else "",
+        "source_path": str(row["source_path"]) if row["source_path"] is not None else "",
+        "target_layer": str(row["target_layer"]) if row["target_layer"] is not None else "",
+        "bronze_schema": str(row["bronze_schema"]) if row["bronze_schema"] is not None else "",
+        "silver_schema": str(row["silver_schema"]) if row["silver_schema"] is not None else "",
+        "gold_schema": str(row["gold_schema"]) if row["gold_schema"] is not None else "",
+        "active_flag": str(row["active_flag"]) if row["active_flag"] is not None else "",
+        "load_order": str(row["load_order"]) if row["load_order"] is not None else "",
+        "created_at": str(row["created_at"]) if row["created_at"] is not None else ""
+    })
+
+print(f"Number of Tables Found: {len(tables_list)}")
+print("Metadata Preview:")
+print(tables_list[:2])
+
+
+# ==========================================
+# 4️⃣ Convert to JSON
+# ==========================================
+
+tables_metadata_json = json.dumps(tables_list)
+
+print("JSON Length:", len(tables_metadata_json))
+
+
+# ==========================================
+# 5️⃣ Set Databricks Task Value
+# ==========================================
+
+dbutils.jobs.taskValues.set(
+    key="tables_metadata",
+    value=tables_metadata_json
+)
+
+print("Task value 'tables_metadata' successfully set.")
+
+# Optional verification
+print("Stored Metadata:")
+print(tables_metadata_json[:1000])
