@@ -1,0 +1,32 @@
+-- Read accounts.csv file
+SELECT * 
+FROM read_files(
+  'file:/Workspace/Users/msruthi.2376@gmail.com/metapipeline/banking_project/csv files/accounts.csv',
+  format => 'csv',
+  header => true
+)
+LIMIT 100;
+-- Read branches.csv file
+SELECT * 
+FROM read_files(
+  'file:/Workspace/Users/msruthi.2376@gmail.com/metapipeline/banking_project/csv files/branches.csv',
+  format => 'csv',
+  header => true
+)
+LIMIT 100;
+-- Read customer.csv file
+SELECT * 
+FROM read_files(
+  'file:/Workspace/Users/msruthi.2376@gmail.com/metapipeline/banking_project/csv files/customer.csv',
+  format => 'csv',
+  header => true
+)
+LIMIT 100;
+-- Read transaction.csv file
+SELECT * 
+FROM read_files(
+  'file:/Workspace/Users/msruthi.2376@gmail.com/metapipeline/banking_project/csv files/transaction.csv',
+  format => 'csv',
+  header => true
+)
+LIMIT 100;
