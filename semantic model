@@ -1,0 +1,224 @@
+# Databricks notebook source
+# Setup and imports
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+# Catalog and schema configuration
+CATALOG = "banking"
+GOLD_SCHEMA = f"{CATALOG}.gold"
+SILVER_SCHEMA = f"{CATALOG}.silver"
+BRONZE_SCHEMA = f"{CATALOG}.bronze"
+
+print(f"✅ Semantic Model Configuration")
+print(f"Catalog: {CATALOG}")
+print(f"Gold Schema: {GOLD_SCHEMA}")
+
+%sql
+-- MAGIC %sql
+-- Entity Relationships and Foreign Key Constraints
+
+-- View relationship between Customer and Accounts
+SELECT 
+  'Customer to Account' as relationship,
+  '1:N' as cardinality,
+  'One customer can have multiple accounts' as description
+  
+UNION ALL
+
+SELECT 
+  'Account to Transaction' as relationship,
+  '1:N' as cardinality,
+  'One account can have multiple transactions' as description
+  
+UNION ALL
+
+SELECT 
+  'Branch to Account' as relationship,
+  '1:N' as cardinality,
+  'One branch can serve multiple accounts' as description
+  
+UNION ALL
+
+SELECT 
+  'Transaction Type to Transaction' as relationship,
+  '1:N' as cardinality,
+  'One transaction type can have multiple transactions' as description
+  
+UNION ALL
+
+SELECT 
+  'Date to Transaction' as relationship,
+  '1:N' as cardinality,
+  'One date can have multiple transactions' as description
+
+%sql
+-- MAGIC %sql
+-- Key Performance Indicators (KPIs)
+
+-- KPI 1: Total Transaction Volume (Last 30 Days)
+WITH transaction_metrics AS (
+  SELECT 
+    COUNT(*) as total_transactions,
+    SUM(amount) as total_amount,
+    SUM(fee_amount) as total_fees,
+    AVG(amount) as avg_transaction,
+    SUM(CASE WHEN is_fraudulent THEN 1 ELSE 0 END) as fraud_count
+  FROM banking.gold.fact_transaction
+  WHERE transaction_date >= DATE_SUB(CURRENT_DATE(), 30)
+),
+
+-- KPI 2: Active Customer Base
+customer_metrics AS (
+  SELECT 
+    COUNT(DISTINCT customer_sk) as active_customers,
+    AVG(credit_score) as avg_credit_score
+  FROM banking.gold.dim_customer
+  WHERE is_current = TRUE
+),
+
+-- KPI 3: Account Health
+account_metrics AS (
+  SELECT 
+    COUNT(*) as total_accounts,
+    SUM(balance) as total_balance,
+    AVG(balance) as avg_balance,
+    SUM(CASE WHEN account_status = 'Active' THEN 1 ELSE 0 END) as active_accounts
+  FROM banking.gold.dim_account
+  WHERE is_current = TRUE
+)
+
+SELECT 
+  'Transaction Volume (30d)' as kpi,
+  CONCAT('$', FORMAT_NUMBER(total_amount, 2)) as value,
+  CONCAT(FORMAT_NUMBER(total_transactions, 0), ' transactions') as detail
+FROM transaction_metrics
+
+UNION ALL
+
+SELECT 
+  'Fee Revenue (30d)' as kpi,
+  CONCAT('$', FORMAT_NUMBER(total_fees, 2)) as value,
+  CONCAT('Avg: $', FORMAT_NUMBER(total_fees/total_transactions, 2), ' per txn') as detail
+FROM transaction_metrics
+
+UNION ALL
+
+SELECT 
+  'Fraud Rate (30d)' as kpi,
+  CONCAT(FORMAT_NUMBER((fraud_count * 100.0 / total_transactions), 2), '%') as value,
+  CONCAT(FORMAT_NUMBER(fraud_count, 0), ' fraudulent transactions') as detail
+FROM transaction_metrics
+
+UNION ALL
+
+SELECT 
+  'Active Customers' as kpi,
+  FORMAT_NUMBER(active_customers, 0) as value,
+  CONCAT('Avg Credit Score: ', FORMAT_NUMBER(avg_credit_score, 0)) as detail
+FROM customer_metrics
+
+UNION ALL
+
+SELECT 
+  'Total Deposits' as kpi,
+  CONCAT('$', FORMAT_NUMBER(total_balance, 2)) as value,
+  CONCAT(FORMAT_NUMBER(active_accounts, 0), ' active accounts') as detail
+FROM account_metrics
+
+UNION ALL
+
+SELECT 
+  'Average Account Balance' as kpi,
+  CONCAT('$', FORMAT_NUMBER(avg_balance, 2)) as value,
+  CONCAT('Across ', FORMAT_NUMBER(total_accounts, 0), ' accounts') as detail
+FROM account_metrics
+
+%sql
+-- MAGIC %sql
+-- Example Query: Comprehensive Customer 360 View
+-- Combines customer, account, and transaction data
+
+SELECT 
+  c.customer_id,
+  c.customer_name,
+  c.email,
+  c.credit_score,
+  c.risk_category,
+  
+  -- Account Summary
+  COUNT(DISTINCT a.account_id) as total_accounts,
+  SUM(a.balance) as total_balance,
+  
+  -- Transaction Summary (Last 90 Days)
+  COUNT(DISTINCT t.txn_id) as transaction_count_90d,
+  SUM(t.amount) as total_transaction_amount_90d,
+  AVG(t.amount) as avg_transaction_amount_90d,
+  SUM(t.fee_amount) as total_fees_paid_90d,
+  
+  -- Risk Indicators
+  SUM(CASE WHEN t.is_fraudulent THEN 1 ELSE 0 END) as fraud_incidents,
+  
+  -- Customer Segment
+  CASE 
+    WHEN SUM(t.amount) > 50000 THEN 'High Value'
+    WHEN SUM(t.amount) > 10000 THEN 'Medium Value'
+    ELSE 'Low Value'
+  END as customer_segment
+  
+FROM banking.gold.dim_customer c
+LEFT JOIN banking.gold.dim_account a 
+  ON c.customer_id = a.customer_id AND a.is_current = TRUE
+LEFT JOIN banking.gold.fact_transaction t 
+  ON a.account_sk = t.account_sk 
+  AND t.transaction_date >= DATE_SUB(CURRENT_DATE(), 90)
+  
+WHERE c.is_current = TRUE
+
+GROUP BY 
+  c.customer_id, c.customer_name, c.email, 
+  c.credit_score, c.risk_category
+  
+ORDER BY total_transaction_amount_90d DESC
+LIMIT 100
+
+%sql
+-- MAGIC %sql
+-- Example Query: Branch Performance Analysis
+
+SELECT 
+  b.branch_code,
+  b.branch_name,
+  b.city,
+  b.state,
+  
+  -- Customer Metrics
+  COUNT(DISTINCT a.customer_id) as unique_customers,
+  COUNT(DISTINCT a.account_id) as total_accounts,
+  SUM(a.balance) as total_deposits,
+  
+  -- Transaction Metrics (Last 30 Days)
+  COUNT(DISTINCT t.txn_id) as transaction_count_30d,
+  SUM(t.amount) as transaction_volume_30d,
+  SUM(t.fee_amount) as fee_revenue_30d,
+  
+  -- Performance Indicators
+  AVG(a.balance) as avg_account_balance,
+  SUM(t.amount) / NULLIF(COUNT(DISTINCT t.txn_id), 0) as avg_transaction_size,
+  
+  -- Risk Metrics
+  SUM(CASE WHEN t.is_fraudulent THEN 1 ELSE 0 END) as fraud_count_30d,
+  
+  -- Branch Ranking
+  RANK() OVER (ORDER BY SUM(t.fee_amount) DESC) as revenue_rank
+  
+FROM banking.gold.dim_branch b
+LEFT JOIN banking.gold.dim_account a 
+  ON b.branch_code = a.branch_code AND a.is_current = TRUE
+LEFT JOIN banking.gold.fact_transaction t 
+  ON a.account_sk = t.account_sk
+  AND t.transaction_date >= DATE_SUB(CURRENT_DATE(), 30)
+  
+GROUP BY 
+  b.branch_code, b.branch_name, b.city, b.state
+  
+ORDER BY fee_revenue_30d DESC
