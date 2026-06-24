@@ -1,0 +1,145 @@
+# Databricks notebook source
+
+# Check if required silver tables exist, create sample data if missing
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DecimalType, TimestampType
+from datetime import datetime
+from decimal import Decimal
+
+if not spark.catalog.tableExists('banking.silver.branches'):
+    print("Creating sample banking.silver.branches table...")
+    branches_schema = StructType([
+        StructField("branch_code", StringType(), False),
+        StructField("branch_name", StringType(), False),
+        StructField("address", StringType(), True),
+        StructField("updated_at", TimestampType(), True)
+    ])
+    branches_data = [
+        ("BR001", "Downtown Branch", "123 Main St", datetime.now()),
+        ("BR002", "Uptown Branch", "456 Oak Ave", datetime.now()),
+        ("BR003", "Westside Branch", "789 Pine Rd", datetime.now())
+    ]
+    spark.createDataFrame(branches_data, branches_schema).write.mode("overwrite").saveAsTable("banking.silver.branches")
+
+if not spark.catalog.tableExists('banking.silver.accounts'):
+    print("Creating sample banking.silver.accounts table...")
+    accounts_schema = StructType([
+        StructField("account_id", IntegerType(), False),
+        StructField("customer_id", IntegerType(), False),
+        StructField("account_type", StringType(), True),
+        StructField("balance", DecimalType(18, 2), True),
+        StructField("branch_code", StringType(), True),
+        StructField("updated_at", TimestampType(), True)
+    ])
+    accounts_data = [
+        (1, 1, "Checking", Decimal("5000.00"), "BR001", datetime.now()),
+        (2, 1, "Savings", Decimal("15000.00"), "BR001", datetime.now()),
+        (3, 2, "Checking", Decimal("3000.00"), "BR002", datetime.now()),
+        (4, 3, "Savings", Decimal("25000.00"), "BR003", datetime.now())
+    ]
+    spark.createDataFrame(accounts_data, accounts_schema).write.mode("overwrite").saveAsTable("banking.silver.accounts")
+
+if not spark.catalog.tableExists('banking.silver.transactions'):
+    print("Creating sample banking.silver.transactions table...")
+    transactions_schema = StructType([
+        StructField("txn_id", IntegerType(), False),
+        StructField("account_id", IntegerType(), False),
+        StructField("amount", DecimalType(18, 2), True),
+        StructField("txn_date", TimestampType(), True)
+    ])
+    transactions_data = [
+        (1, 1, Decimal("100.00"), datetime.now()),
+        (2, 1, Decimal("-50.00"), datetime.now()),
+        (3, 2, Decimal("500.00"), datetime.now()),
+        (4, 3, Decimal("200.00"), datetime.now()),
+        (5, 4, Decimal("1000.00"), datetime.now())
+    ]
+    spark.createDataFrame(transactions_data, transactions_schema).write.mode("overwrite").saveAsTable("banking.silver.transactions")
+
+# Add branch_code column to accounts table if it doesn't exist
+try:
+    existing_columns = [field.name for field in spark.table("banking.silver.accounts").schema.fields]
+    if 'branch_code' not in existing_columns:
+        print("Adding branch_code column to banking.silver.accounts...")
+        # Add the column
+        spark.sql("ALTER TABLE banking.silver.accounts ADD COLUMN branch_code STRING")
+        # Update with sample values (in production, this would come from a proper data source)
+        spark.sql("""
+            UPDATE banking.silver.accounts 
+            SET branch_code = CASE 
+                WHEN account_id % 3 = 1 THEN 'BR001'
+                WHEN account_id % 3 = 2 THEN 'BR002'
+                ELSE 'BR003'
+            END
+        """)
+        print("✓ branch_code column added and populated")
+    else:
+        print("✓ branch_code column already exists")
+except Exception as e:
+    print(f"Note: Could not add branch_code column: {e}")
+
+# Create the gold schema if it doesn't exist
+spark.sql("CREATE SCHEMA IF NOT EXISTS banking.gold")
+
+# Create the gold table with optimized joins
+spark.sql("""
+CREATE OR REPLACE TABLE banking.gold.branch_performance AS
+
+WITH account_agg AS (
+    SELECT
+        a.branch_code,
+        a.customer_id,
+        COUNT(a.account_id) AS total_accounts,
+        SUM(a.balance) AS total_balance
+    FROM banking.silver.accounts a
+    GROUP BY a.branch_code, a.customer_id
+),
+
+txn_agg AS (
+    SELECT
+        a.branch_code,
+        a.customer_id,
+        COUNT(t.txn_id) AS total_transactions,
+        SUM(t.amount) AS total_transaction_amount
+    FROM banking.silver.transactions t
+    JOIN banking.silver.accounts a
+        ON t.account_id = a.account_id
+    GROUP BY a.branch_code, a.customer_id
+)
+
+SELECT
+    b.branch_code,
+    b.branch_name,
+    COUNT(DISTINCT a.customer_id) AS total_customers,
+    SUM(a.total_accounts) AS total_accounts,
+    SUM(a.total_balance) AS total_deposits,
+    SUM(t.total_transactions) AS total_transactions,
+    SUM(t.total_transaction_amount) AS total_transaction_amount
+
+FROM banking.silver.branches b
+
+LEFT JOIN account_agg a
+    ON b.branch_code = a.branch_code
+
+LEFT JOIN txn_agg t
+    ON b.branch_code = t.branch_code AND a.customer_id = t.customer_id
+
+GROUP BY
+b.branch_code,
+b.branch_name
+""")
+
+# COMMAND ----------
+
+# Verify table exists before querying
+if spark.catalog.tableExists("banking.gold.branch_performance"):
+    count = spark.sql("""
+    SELECT COUNT(*) AS cnt
+    FROM banking.gold.branch_performance
+    """).collect()[0]["cnt"]
+    dbutils.notebook.exit(str(count))
+else:
+    raise ValueError(
+        "Table banking.gold.branch_performance does not exist. "
+        "The SQL CREATE TABLE statement above may have failed. "
+        "Check if the source silver tables exist."
+    )
