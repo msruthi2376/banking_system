@@ -1,0 +1,241 @@
+%python
+# Databricks notebook source
+# =====================================================
+# 1️⃣ Imports & Setup
+# =====================================================
+
+import json
+import ast  # Added for safer parsing
+import time
+from pyspark.sql.functions import current_timestamp, col, max as spark_max, concat_ws, regexp_extract, row_number
+from pyspark.sql.window import Window
+from delta.tables import DeltaTable
+
+status = "SUCCESS"
+error_message = None
+records_read = 0
+records_written = 0
+
+# =====================================================
+# 2️⃣ Widgets
+# =====================================================
+
+dbutils.widgets.text(
+    "table_metadata",
+    "{'table_id': '1', 'table_name': 'customers', 'source_system': 'banking_project', "
+    "'source_schema': 'banking', 'source_table': 'customers', "
+    "'source_path': '', 'bronze_schema': 'bronze', "
+    "'silver_schema': 'silver', 'active_flag': 'True', "
+    "'load_order': '1', 'created_at': '2026-02-18 13:23:37.053711'}"
+)
+
+dbutils.widgets.text(
+    "table_parameters",
+    "{'load_type': 'MERGE', "
+    "'primary_key': 'customer_id', "
+    "'watermark_column': 'updated_at'}"
+)
+
+dbutils.widgets.text("run_id", "472519629468310")
+
+# --- FIXED PARSING LOGIC START ---
+run_id = dbutils.widgets.get("run_id")
+
+# Safely parse table_metadata to handle both dict and list formats
+table_metadata_raw = ast.literal_eval(dbutils.widgets.get("table_metadata"))
+if isinstance(table_metadata_raw, list):
+    table_metadata = table_metadata_raw[0]
+else:
+    table_metadata = table_metadata_raw
+
+# Safely parse table_parameters
+table_parameters_raw = ast.literal_eval(dbutils.widgets.get("table_parameters"))
+if isinstance(table_parameters_raw, list):
+    table_parameters = table_parameters_raw[0]
+else:
+    table_parameters = table_parameters_raw
+# --- FIXED PARSING LOGIC END ---
+
+table_id = int(table_metadata["table_id"])
+table_name = table_metadata["table_name"]
+bronze_schema = table_metadata["bronze_schema"]
+silver_schema = table_metadata["silver_schema"]
+
+load_type = table_parameters.get("load_type")
+primary_key = table_parameters.get("primary_key")
+watermark_column = table_parameters.get("watermark_column")
+
+bronze_table = f"banking.{bronze_schema}.{table_name}"
+silver_table = f"banking.{silver_schema}.{table_name}"
+
+print(f"Processing Table: {table_name}")
+print(f"Load Type: {load_type}")
+print(f"Run ID: {run_id}")
+
+# COMMAND ----------
+
+# =====================================================
+# 3️⃣ TRY-CATCH BLOCK FOR AUDIT CONTROL
+# =====================================================
+
+try:
+    # -----------------------------------------
+    # Read Bronze Table
+    # -----------------------------------------
+    print(f"Reading from bronze table: {bronze_table}")
+    
+    # Check if bronze schema exists first
+    try:
+        spark.sql(f"DESCRIBE SCHEMA banking.{bronze_schema}").collect()
+    except Exception:
+        raise ValueError(
+            f"Bronze schema 'banking.{bronze_schema}' does not exist. "
+            f"The source_to_bronze pipeline must be run first to create the bronze schema and load data."
+        )
+    
+    if not spark.catalog.tableExists(bronze_table):
+        raise ValueError(
+            f"Bronze table '{bronze_table}' does not exist. "
+            f"Run the source_to_bronze pipeline first to populate this table."
+        )
+    
+    bronze_df = spark.table(bronze_table)
+    print(f"Bronze table columns: {bronze_df.columns}")
+
+    # -----------------------------------------
+    # Apply Watermark Filtering (for incremental loads)
+    # -----------------------------------------
+    if load_type in ["APPEND", "MERGE"] and watermark_column:
+        if watermark_column not in bronze_df.columns:
+            print(f"⚠️  Warning: Watermark column '{watermark_column}' not found in {bronze_table}.")
+            print(f"Available columns: {', '.join(bronze_df.columns)}")
+            print("Proceeding without watermark filtering.")
+        else:
+            # Check for existing watermark
+            watermark_result = spark.sql(f"""
+                SELECT last_watermark_value
+                FROM banking.metadata.table_watermarks
+                WHERE table_id = {table_id}
+            """).collect()
+
+            last_watermark = None
+            if len(watermark_result) > 0:
+                last_watermark = watermark_result[0]["last_watermark_value"]
+                print(f"Last watermark: {last_watermark}")
+
+            if last_watermark:
+                # Apply filter and trigger action to detect errors early
+                bronze_df = bronze_df.filter(col(watermark_column) > last_watermark)
+                print(f"Applied watermark filter: {watermark_column} > {last_watermark}")
+
+    # Trigger action to count records and detect schema/data issues
+    records_read = bronze_df.count()
+    print(f"Records to process: {records_read}")
+
+    if records_read == 0:
+        print("No new records to process. Exiting.")
+        status = "SUCCESS"
+    else:
+        # -----------------------------------------
+        # Add Audit Columns for Silver
+        # -----------------------------------------
+        # Note: withColumn is lazy, but validated by subsequent write operations
+        silver_df = bronze_df.withColumn("update_timestamp", current_timestamp())
+        
+        # Add customer_name column if missing (for backward compatibility with existing silver table)
+        if "customer_name" not in silver_df.columns and "first_name" in silver_df.columns and "last_name" in silver_df.columns:
+            silver_df = silver_df.withColumn("customer_name", concat_ws(" ", col("first_name"), col("last_name")))
+        
+        # Transform customer_id: extract numeric part and cast to int if needed
+        if "customer_id" in silver_df.columns:
+            silver_df = silver_df.withColumn("customer_id", regexp_extract(col("customer_id"), r"(\d+)", 1).cast("int"))
+        
+        # Deduplicate: keep only the most recent record per customer_id based on updated_at
+        if watermark_column and watermark_column in silver_df.columns:
+            window_spec = Window.partitionBy("customer_id").orderBy(col(watermark_column).desc())
+            silver_df = silver_df.withColumn("row_num", row_number().over(window_spec)).filter(col("row_num") == 1).drop("row_num")
+        
+        # Ensure silver schema exists
+        spark.sql(f"CREATE SCHEMA IF NOT EXISTS banking.{silver_schema}").collect()
+
+        # -----------------------------------------
+        # Write to Silver Table
+        # -----------------------------------------
+        if not spark.catalog.tableExists(silver_table):
+            print(f"Creating silver table: {silver_table}")
+            silver_df.write.format("delta").mode("overwrite").saveAsTable(silver_table)
+            records_written = records_read
+        else:
+            if load_type == "FULL":
+                print(f"Full load: Overwriting {silver_table}")
+                silver_df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(silver_table)
+                records_written = records_read
+            elif load_type == "APPEND":
+                print(f"Append load: Appending to {silver_table}")
+                silver_df.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(silver_table)
+                records_written = records_read
+            elif load_type == "MERGE":
+                if not primary_key:
+                    raise ValueError("Primary key required for MERGE load type.")
+                print(f"Merge load: Merging into {silver_table} on {primary_key}")
+                delta_table = DeltaTable.forName(spark, silver_table)
+                merge_condition = f"t.{primary_key} = s.{primary_key}"
+                
+                # Get target table columns
+                target_columns = set(spark.table(silver_table).columns)
+                
+                # Select only columns that exist in target (excluding insert_timestamp which we'll set separately)
+                common_columns = [c for c in silver_df.columns if c in target_columns and c != "insert_timestamp"]
+                silver_df_subset = silver_df.select(*common_columns)
+                
+                # Build explicit column mappings
+                update_dict = {col: f"s.{col}" for col in common_columns}
+                insert_dict = {**update_dict, "insert_timestamp": "current_timestamp()"}
+                
+                (
+                    delta_table.alias("t")
+                    .merge(silver_df_subset.alias("s"), merge_condition)
+                    .whenMatchedUpdate(set=update_dict)
+                    .whenNotMatchedInsert(values=insert_dict)
+                    .execute()
+                )
+                records_written = records_read
+            else:
+                raise ValueError(f"Unsupported load_type: {load_type}")
+
+        print(f"Records written: {records_written}")
+
+        # -----------------------------------------
+        # Update Watermark for Next Run
+        # -----------------------------------------
+        if load_type in ["APPEND", "MERGE"] and watermark_column:
+            if watermark_column in bronze_df.columns:
+                max_value = bronze_df.agg(spark_max(col(watermark_column))).collect()[0][0]
+                if max_value:
+                    print(f"Updating watermark to: {max_value}")
+                    spark.sql(f"""
+                        MERGE INTO banking.metadata.table_watermarks t
+                        USING (SELECT {table_id} AS table_id) s
+                        ON t.table_id = s.table_id
+                        WHEN MATCHED THEN UPDATE SET
+                            last_watermark_value = '{max_value}',
+                            last_updated_at = current_timestamp()
+                        WHEN NOT MATCHED THEN
+                            INSERT (table_id, last_watermark_value, last_updated_at)
+                            VALUES ({table_id}, '{max_value}', current_timestamp())
+                    """).collect()
+            else:
+                print(f"⚠️  Skipping watermark update - column '{watermark_column}' not found.")
+
+        print("✅ Bronze to Silver load completed successfully.")
+        status = "SUCCESS"
+
+except Exception as e:
+    status = "FAILED"
+    error_message = str(e)
+    print(f"❌ Error occurred: {error_message}")
+    raise
+
+finally:
+    end_time = spark.sql("SELECT current_timestamp()").collect()[0][0]
+    print(f"Pipeline execution completed. Status: {status}")
