@@ -1,0 +1,32 @@
+-- Read credit_bureau_reports_1.csv file
+SELECT * 
+FROM read_files(
+  'file:/Workspace/Users/msruthi.2376@gmail.com/metapipeline/banking_project/blob files/credit_bureau_reports_1.csv',
+  format => 'csv',
+  header => true
+)
+LIMIT 100;
+-- Read credit_bureau_reports_2_incremental.csv file
+SELECT * 
+FROM read_files(
+  'file:/Workspace/Users/msruthi.2376@gmail.com/metapipeline/banking_project/blob files/credit_bureau_reports_2_incremental.csv',
+  format => 'csv',
+  header => true
+)
+LIMIT 100;
+-- Read payment_gateway_logs_1.csv file
+SELECT * 
+FROM read_files(
+  'file:/Workspace/Users/msruthi.2376@gmail.com/metapipeline/banking_project/blob files/payment_gateway_logs_1.csv',
+  format => 'csv',
+  header => true
+)
+LIMIT 100;
+-- Read payment_gateway_logs_2_incremental.csv file
+SELECT * 
+FROM read_files(
+  'file:/Workspace/Users/msruthi.2376@gmail.com/metapipeline/banking_project/blob files/payment_gateway_logs_2_incremental.csv',
+  format => 'csv',
+  header => true
+)
+LIMIT 100;
