@@ -1,0 +1,23 @@
+# Databricks notebook source
+spark.sql("""
+CREATE OR REPLACE TABLE banking.gold.transaction_channel_summary AS
+
+SELECT
+DATE(txn_date) AS txn_date,
+COUNT(*) AS total_transactions,
+SUM(amount) AS total_amount
+
+FROM banking.silver.transactions
+
+GROUP BY
+DATE(txn_date)
+""")
+
+# COMMAND ----------
+
+count = spark.sql("""
+SELECT COUNT(*) AS cnt
+FROM banking.gold.transaction_channel_summary
+""").collect()[0]["cnt"]
+
+dbutils.notebook.exit(str(count))
