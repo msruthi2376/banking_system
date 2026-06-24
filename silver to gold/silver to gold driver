@@ -1,0 +1,148 @@
+# Databricks notebook source
+import json
+from datetime import datetime
+
+# Default test values for standalone execution
+default_run_id = "999999999999999"
+default_table_metadata = '{"table_id": "1", "table_name": "customers"}'
+
+dbutils.widgets.text("run_id", default_run_id)
+dbutils.widgets.text("table_metadata", default_table_metadata)
+
+run_id = dbutils.widgets.get("run_id")
+table_metadata = dbutils.widgets.get("table_metadata")
+
+# Use default values if widgets are empty (for standalone testing)
+if not run_id:
+    run_id = default_run_id
+    print(f"ℹ️  Using default run_id for testing: {run_id}")
+
+if not table_metadata:
+    table_metadata = default_table_metadata
+    print(f"ℹ️  Using default table_metadata for testing: {table_metadata}")
+
+table_metadata = json.loads(table_metadata.replace("'", '"'))
+
+table_id = table_metadata["table_id"]
+table_name = table_metadata["table_name"]
+
+start_time = datetime.utcnow()
+
+print("Run ID:", run_id)
+print("Table ID:", table_id)
+print("Table Name:", table_name)
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC create schema if not exists banking.gold;
+
+# COMMAND ----------
+
+entry_exists = spark.sql(f"""
+    SELECT 1
+    FROM banking.metadata.pipeline_runs
+    WHERE run_id = {run_id}
+    AND table_id = {table_id}
+""").count() > 0
+
+if entry_exists:
+    
+    spark.sql(f"""
+        UPDATE banking.metadata.pipeline_runs
+        SET
+            layer = 'Gold',
+            start_time = TIMESTAMP('{start_time}'),
+            end_time = NULL,
+            status = 'INPROGRESS',
+            number_of_records = NULL,
+            error_message = NULL
+        WHERE run_id = {run_id}
+        AND table_id = {table_id}
+    """)
+
+else:
+
+    spark.sql(f"""
+        INSERT INTO banking.metadata.pipeline_runs
+        VALUES (
+            {run_id},
+            {table_id},
+            'Gold',
+            TIMESTAMP('{start_time}'),
+            NULL,
+            'INPROGRESS',
+            NULL,
+            NULL
+        )
+    """)
+
+print("Audit entry created / updated")
+
+# COMMAND ----------
+
+# Map table names to actual notebook names
+table_to_notebook = {
+    "customers": "customers_360",
+    "customers_360": "customers_360",
+    "branch_performance": "branch_performance",
+    "daily_bank": "daily_bank",
+    "risk_customer": "risk_customer",
+    "transaction_channel": "transaction_channel"
+}
+
+# Get the correct notebook name
+notebook_name = table_to_notebook.get(table_name, table_name)
+notebook_path = f"/Users/msruthi.2376@gmail.com/metapipeline/banking_project/05_silver_to_gold/gold transformation/{notebook_name}.py"
+
+print("Notebook to execute:", notebook_path)
+
+# COMMAND ----------
+
+status = "SUCCESS"
+error_message = None
+records = None
+
+try:
+
+    result = dbutils.notebook.run(
+        notebook_path,
+        timeout_seconds=0
+    )
+
+    # Expect the notebook to return record count
+    if result:
+        records = int(result)
+
+    print("Notebook completed successfully")
+    print("Records:", records)
+
+except Exception as e:
+
+    status = "FAILED"
+    error_message = str(e)
+
+    print("Notebook failed")
+    print(error_message)
+
+# COMMAND ----------
+
+end_time = datetime.utcnow()
+
+spark.sql(f"""
+    UPDATE banking.metadata.pipeline_runs
+    SET
+        end_time = TIMESTAMP('{end_time}'),
+        status = '{status}',
+        number_of_records = {records if records else 'NULL'},
+        error_message = {f"'{error_message}'" if error_message else 'NULL'}
+    WHERE run_id = {run_id}
+    AND table_id = {table_id}
+""")
+
+print("Audit table updated")
+
+# COMMAND ----------
+
+if status == "FAILED":
+    raise Exception(error_message)
