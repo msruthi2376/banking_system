@@ -1,0 +1,62 @@
+%sql
+-- Create dim_customer (Type 2 SCD)
+CREATE OR REPLACE TABLE banking.gold.dim_customer (
+  customer_sk BIGINT GENERATED ALWAYS AS IDENTITY,
+  customer_id INT NOT NULL,
+  customer_name STRING,
+  email STRING,
+  credit_score INT,
+  risk_category STRING,
+  effective_date TIMESTAMP NOT NULL,
+  end_date TIMESTAMP,
+  is_current BOOLEAN NOT NULL,
+  insert_timestamp TIMESTAMP,
+  update_timestamp TIMESTAMP,
+  PRIMARY KEY (customer_sk)
+) USING DELTA
+CLUSTER BY (customer_id);
+
+-- Create dim_account (Type 2 SCD)
+CREATE OR REPLACE TABLE banking.gold.dim_account (
+  account_sk BIGINT GENERATED ALWAYS AS IDENTITY,
+  account_id INT NOT NULL,
+  customer_id INT NOT NULL,
+  account_type STRING,
+  balance DECIMAL(18,2),
+  branch_code STRING,
+  account_status STRING,
+  effective_date TIMESTAMP NOT NULL,
+  end_date TIMESTAMP,
+  is_current BOOLEAN NOT NULL,
+  insert_timestamp TIMESTAMP,
+  update_timestamp TIMESTAMP,
+  PRIMARY KEY (account_sk)
+) USING DELTA
+CLUSTER BY (account_id, customer_id);
+
+-- Create dim_branch (Type 1 SCD)
+CREATE OR REPLACE TABLE banking.gold.dim_branch (
+  branch_sk BIGINT GENERATED ALWAYS AS IDENTITY,
+  branch_code STRING NOT NULL,
+  branch_name STRING,
+  city STRING,
+  state STRING,
+  region STRING,
+  opened_date TIMESTAMP,
+  is_active BOOLEAN,
+  insert_timestamp TIMESTAMP,
+  update_timestamp TIMESTAMP,
+  PRIMARY KEY (branch_sk)
+) USING DELTA
+CLUSTER BY (branch_code);
+
+-- Create dim_transaction_type
+CREATE OR REPLACE TABLE banking.gold.dim_transaction_type (
+  transaction_type_sk BIGINT GENERATED ALWAYS AS IDENTITY,
+  transaction_type_code STRING NOT NULL,
+  transaction_category STRING,
+  channel STRING,
+  is_fee_applicable BOOLEAN,
+  description STRING,
+  PRIMARY KEY (transaction_type_sk)
+) USING DELTA;
