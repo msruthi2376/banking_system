@@ -1,0 +1,18 @@
+# Databricks notebook source
+spark.sql("""
+CREATE OR REPLACE TABLE banking.gold.risk_customer_summary AS
+
+SELECT
+COUNT(customer_id) AS total_customers
+
+FROM banking.silver.credit_bureau_reports
+""")
+
+ #COMMAND ----------
+
+count = spark.sql("""
+SELECT COUNT(*) AS cnt
+FROM banking.gold.risk_customer_summary
+""").collect()[0]["cnt"]
+
+dbutils.notebook.exit(str(count))
