@@ -1,0 +1,31 @@
+%sql
+-- Create single comprehensive fact_transaction table
+-- This is the atomic grain table - all aggregations will be derived from this
+CREATE OR REPLACE TABLE banking.gold.fact_transaction (
+  transaction_sk BIGINT GENERATED ALWAYS AS IDENTITY,
+  txn_id INT NOT NULL,
+  date_sk BIGINT NOT NULL,
+  customer_sk BIGINT NOT NULL,
+  account_sk BIGINT NOT NULL,
+  branch_sk BIGINT NOT NULL,
+  transaction_type_sk BIGINT NOT NULL,
+  transaction_date TIMESTAMP NOT NULL,
+  amount DECIMAL(18,2) NOT NULL,
+  balance_after DECIMAL(18,2),
+  fee_amount DECIMAL(18,2),
+  is_fraudulent BOOLEAN,
+  insert_timestamp TIMESTAMP,
+  FOREIGN KEY (date_sk) REFERENCES banking.gold.dim_date(date_sk),
+  FOREIGN KEY (customer_sk) REFERENCES banking.gold.dim_customer(customer_sk),
+  FOREIGN KEY (account_sk) REFERENCES banking.gold.dim_account(account_sk),
+  FOREIGN KEY (branch_sk) REFERENCES banking.gold.dim_branch(branch_sk),
+  FOREIGN KEY (transaction_type_sk) REFERENCES banking.gold.dim_transaction_type(transaction_type_sk)
+) USING DELTA
+CLUSTER BY (date_sk, customer_sk);
+
+-- Note: Daily snapshots and monthly summaries are derived via queries, not separate physical tables
+-- This simplifies the architecture and eliminates data duplication
+
+%sql
+-- Verify all dimensional model tables were created
+SHOW TABLES IN banking.gold;
