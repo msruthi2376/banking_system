@@ -1,0 +1,32 @@
+%sql
+-- Verify all dimension and fact tables are populated
+SELECT 'dim_branch' AS table_name, COUNT(*) AS record_count FROM banking.gold.dim_branch
+UNION ALL
+SELECT 'dim_transaction_type', COUNT(*) FROM banking.gold.dim_transaction_type
+UNION ALL
+SELECT 'dim_customer', COUNT(*) FROM banking.gold.dim_customer
+UNION ALL
+SELECT 'dim_customer (current)', COUNT(*) FROM banking.gold.dim_customer WHERE is_current = TRUE
+UNION ALL
+SELECT 'dim_account', COUNT(*) FROM banking.gold.dim_account
+UNION ALL
+SELECT 'dim_account (current)', COUNT(*) FROM banking.gold.dim_account WHERE is_current = TRUE
+UNION ALL
+SELECT 'dim_date', COUNT(*) FROM banking.gold.dim_date
+UNION ALL
+SELECT 'fact_transaction', COUNT(*) FROM banking.gold.fact_transaction
+ORDER BY table_name;
+
+%sql
+-- Sample data from dim_customer (Type 2 SCD)
+SELECT 
+  customer_sk,
+  customer_id,
+  customer_name,
+  email,
+  risk_category,
+  is_current,
+  effective_date,
+  end_date
+FROM banking.gold.dim_customer
+ORDER BY customer_id, effective_date DESC;
