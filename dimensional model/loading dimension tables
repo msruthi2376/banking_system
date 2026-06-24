@@ -1,0 +1,174 @@
+%sql
+-- Populate dim_branch from silver.branches (Type 1 SCD - overwrite on changes)
+MERGE INTO banking.gold.dim_branch AS tgt
+USING (
+  SELECT 
+    branch_code,
+    branch_name,
+    city,
+    state,
+    CASE 
+      WHEN state IN ('NY', 'NJ', 'CT', 'PA', 'MA') THEN 'Northeast'
+      WHEN state IN ('CA', 'WA', 'OR', 'NV', 'AZ') THEN 'West'
+      WHEN state IN ('TX', 'FL', 'GA', 'NC', 'VA') THEN 'South'
+      WHEN state IN ('IL', 'OH', 'MI', 'IN', 'WI') THEN 'Midwest'
+      ELSE 'Other'
+    END AS region,
+    opened_date,
+    TRUE AS is_active,
+    CURRENT_TIMESTAMP() AS insert_timestamp,
+    CURRENT_TIMESTAMP() AS update_timestamp
+  FROM banking.silver.branches
+) AS src
+ON tgt.branch_code = src.branch_code
+WHEN MATCHED THEN
+  UPDATE SET
+    tgt.branch_name = src.branch_name,
+    tgt.city = src.city,
+    tgt.state = src.state,
+    tgt.region = src.region,
+    tgt.opened_date = src.opened_date,
+    tgt.is_active = src.is_active,
+    tgt.update_timestamp = src.update_timestamp
+WHEN NOT MATCHED THEN
+  INSERT (
+    branch_code, branch_name, city, state, region, 
+    opened_date, is_active, insert_timestamp, update_timestamp
+  )
+  VALUES (
+    src.branch_code, src.branch_name, src.city, src.state, src.region,
+    src.opened_date, src.is_active, src.insert_timestamp, src.update_timestamp
+  );
+
+%sql
+-- Populate dim_transaction_type with standard banking transaction types
+INSERT INTO banking.gold.dim_transaction_type (
+  transaction_type_code, transaction_category, channel, is_fee_applicable, description
+)
+VALUES
+  ('DEP_CASH', 'Deposit', 'Branch', FALSE, 'Cash Deposit at Branch'),
+  ('DEP_CHECK', 'Deposit', 'Branch', FALSE, 'Check Deposit at Branch'),
+  ('DEP_TRANSFER', 'Deposit', 'Online', FALSE, 'Electronic Transfer Deposit'),
+  ('DEP_MOBILE', 'Deposit', 'Mobile', FALSE, 'Mobile Check Deposit'),
+  ('WD_CASH', 'Withdrawal', 'ATM', TRUE, 'ATM Cash Withdrawal'),
+  ('WD_CHECK', 'Withdrawal', 'Branch', FALSE, 'Check Withdrawal'),
+  ('WD_TRANSFER', 'Withdrawal', 'Online', FALSE, 'Electronic Transfer Withdrawal'),
+  ('TRANSFER_IN', 'Transfer', 'Online', FALSE, 'Incoming Account Transfer'),
+  ('TRANSFER_OUT', 'Transfer', 'Online', FALSE, 'Outgoing Account Transfer'),
+  ('PAYMENT_BILL', 'Payment', 'Online', FALSE, 'Bill Payment'),
+  ('PAYMENT_CC', 'Payment', 'Online', FALSE, 'Credit Card Payment'),
+  ('FEE_MONTHLY', 'Fee', 'System', FALSE, 'Monthly Maintenance Fee'),
+  ('FEE_OVERDRAFT', 'Fee', 'System', FALSE, 'Overdraft Fee'),
+  ('FEE_ATM', 'Fee', 'ATM', FALSE, 'ATM Fee (Out of Network)'),
+  ('INTEREST_CREDIT', 'Interest', 'System', FALSE, 'Interest Earned'),
+  ('PURCHASE_DEBIT', 'Purchase', 'POS', TRUE, 'Debit Card Purchase'),
+  ('REFUND', 'Refund', 'System', FALSE, 'Transaction Refund'),
+  ('REVERSAL', 'Reversal', 'System', FALSE, 'Transaction Reversal');
+
+%sql
+-- SCD Type 2: Step 1 - Close expired customer records
+MERGE INTO banking.gold.dim_customer AS tgt
+USING (
+  SELECT DISTINCT
+    c.customer_id,
+    c.customer_name,
+    c.email
+  FROM banking.silver.customers c
+) AS src
+ON tgt.customer_id = src.customer_id
+  AND tgt.is_current = TRUE
+  AND (
+    tgt.customer_name != src.customer_name 
+    OR tgt.email != src.email
+    OR (tgt.customer_name IS NULL AND src.customer_name IS NOT NULL)
+    OR (tgt.email IS NULL AND src.email IS NOT NULL)
+  )
+WHEN MATCHED THEN
+  UPDATE SET
+    tgt.end_date = CURRENT_TIMESTAMP(),
+    tgt.is_current = FALSE,
+    tgt.update_timestamp = CURRENT_TIMESTAMP();
+
+%sql
+-- SCD Type 2: Step 2 - Insert new and changed customer records
+INSERT INTO banking.gold.dim_customer (
+  customer_id, customer_name, email, credit_score, risk_category,
+  effective_date, end_date, is_current, insert_timestamp, update_timestamp
+)
+SELECT 
+  c.customer_id,
+  c.customer_name,
+  c.email,
+  NULL AS credit_score,  -- Will be populated when credit_bureau_reports table has score data
+  'Unknown' AS risk_category,
+  CURRENT_TIMESTAMP() AS effective_date,
+  NULL AS end_date,
+  TRUE AS is_current,
+  CURRENT_TIMESTAMP() AS insert_timestamp,
+  CURRENT_TIMESTAMP() AS update_timestamp
+FROM banking.silver.customers c
+WHERE NOT EXISTS (
+  SELECT 1 
+  FROM banking.gold.dim_customer d
+  WHERE d.customer_id = c.customer_id
+    AND d.is_current = TRUE
+    AND d.customer_name = c.customer_name
+    AND d.email = c.email
+);
+
+%sql
+-- SCD Type 2: Step 1 - Close expired account records
+MERGE INTO banking.gold.dim_account AS tgt
+USING (
+  SELECT DISTINCT
+    a.account_id,
+    a.customer_id,
+    a.account_type,
+    a.balance,
+    a.branch_code,
+    'Active' AS account_status
+  FROM banking.silver.accounts a
+) AS src
+ON tgt.account_id = src.account_id
+  AND tgt.is_current = TRUE
+  AND (
+    tgt.customer_id != src.customer_id
+    OR tgt.account_type != src.account_type
+    OR tgt.branch_code != src.branch_code
+    OR ABS(tgt.balance - src.balance) > 0.01  -- Track significant balance changes
+  )
+WHEN MATCHED THEN
+  UPDATE SET
+    tgt.end_date = CURRENT_TIMESTAMP(),
+    tgt.is_current = FALSE,
+    tgt.update_timestamp = CURRENT_TIMESTAMP();
+
+%sql
+-- SCD Type 2: Step 2 - Insert new and changed account records
+INSERT INTO banking.gold.dim_account (
+  account_id, customer_id, account_type, balance, branch_code, account_status,
+  effective_date, end_date, is_current, insert_timestamp, update_timestamp
+)
+SELECT 
+  a.account_id,
+  a.customer_id,
+  a.account_type,
+  a.balance,
+  a.branch_code,
+  'Active' AS account_status,
+  CURRENT_TIMESTAMP() AS effective_date,
+  NULL AS end_date,
+  TRUE AS is_current,
+  CURRENT_TIMESTAMP() AS insert_timestamp,
+  CURRENT_TIMESTAMP() AS update_timestamp
+FROM banking.silver.accounts a
+WHERE NOT EXISTS (
+  SELECT 1 
+  FROM banking.gold.dim_account d
+  WHERE d.account_id = a.account_id
+    AND d.is_current = TRUE
+    AND d.customer_id = a.customer_id
+    AND d.account_type = a.account_type
+    AND d.branch_code = a.branch_code
+    AND ABS(d.balance - a.balance) <= 0.01
+);
