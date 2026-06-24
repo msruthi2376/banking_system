@@ -1,0 +1,31 @@
+%sql
+-- Load fact_transaction from silver tables
+-- This is the single comprehensive fact table at transaction grain
+INSERT INTO banking.gold.fact_transaction (
+  txn_id, date_sk, customer_sk, account_sk, branch_sk,
+  transaction_type_sk, transaction_date, amount, balance_after, fee_amount, is_fraudulent,
+  insert_timestamp
+)
+SELECT 
+  t.txn_id,
+  CAST(DATE_FORMAT(t.txn_date, 'yyyyMMdd') AS BIGINT) AS date_sk,
+  dc.customer_sk,
+  da.account_sk,
+  db.branch_sk,
+  COALESCE(dtt.transaction_type_sk, 1) AS transaction_type_sk,
+  t.txn_date AS transaction_date,
+  t.amount,
+  a.balance AS balance_after,
+  0.00 AS fee_amount,
+  FALSE AS is_fraudulent,
+  CURRENT_TIMESTAMP() AS insert_timestamp
+FROM banking.silver.transactions t
+INNER JOIN banking.silver.accounts a ON t.account_id = a.account_id
+INNER JOIN banking.gold.dim_customer dc ON a.customer_id = dc.customer_id AND dc.is_current = TRUE
+INNER JOIN banking.gold.dim_account da ON a.account_id = da.account_id AND da.is_current = TRUE
+INNER JOIN banking.gold.dim_branch db ON a.branch_code = db.branch_code
+LEFT JOIN banking.gold.dim_transaction_type dtt ON dtt.transaction_type_code = 'DEP_CASH'
+WHERE NOT EXISTS (
+  SELECT 1 FROM banking.gold.fact_transaction ft
+  WHERE ft.txn_id = t.txn_id
+);
