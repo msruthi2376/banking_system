@@ -1,0 +1,245 @@
+# Databricks notebook source
+import json
+import ast
+from pyspark.sql.functions import current_timestamp, lit, col, to_timestamp
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+
+# =====================================================
+# 1️⃣ Setup & Widgets
+# =====================================================
+
+start_time = spark.sql("SELECT current_timestamp()").collect()[0][0]
+
+# Default metadata for testing
+dbutils.widgets.text("table_metadata", "{'table_id': '1', 'table_name': 'customers'}")
+dbutils.widgets.text("table_parameters", "{'load_type': 'MERGE', 'primary_key': 'customer_id', 'watermark_column': 'updated_at'}")
+dbutils.widgets.text("run_id", "12345")
+
+run_id = dbutils.widgets.get("run_id")
+
+# FIX: Safely parse via ast.literal_eval instead of fragile json.loads + replace
+table_metadata_raw = ast.literal_eval(dbutils.widgets.get("table_metadata"))
+
+# FIX: Handle both dict (local testing) and list (job runtime) formats dynamically
+if isinstance(table_metadata_raw, list):
+    table_metadata = table_metadata_raw[0] if table_metadata_raw else {}
+else:
+    table_metadata = table_metadata_raw
+
+# FIX: Safely parse table parameters via ast
+table_parameters = ast.literal_eval(dbutils.widgets.get("table_parameters"))
+
+table_id = int(table_metadata["table_id"])
+table_name = table_metadata["table_name"]
+load_type = table_parameters.get("load_type")
+watermark_column = table_parameters.get("watermark_column")
+bronze_table_fqn = f"main.default.bronze_{table_name}" # Adjusted for standard catalog
+
+# COMMAND ----------
+# =====================================================
+# 2️⃣ Initialize Metadata Tables (If they don't exist)
+# =====================================================
+
+spark.sql("CREATE SCHEMA IF NOT EXISTS main.metadata")
+spark.sql("""
+    CREATE TABLE IF NOT EXISTS main.metadata.pipeline_runs 
+    (run_id STRING, table_id INT, layer STRING, start_time TIMESTAMP, end_time TIMESTAMP, status STRING, number_of_records INT, error_message STRING)
+""")
+spark.sql("""
+    CREATE TABLE IF NOT EXISTS main.metadata.table_watermarks 
+    (table_id INT, last_watermark_value STRING)
+""")
+
+# COMMAND ----------
+# =====================================================
+# 3️⃣ Audit Entry (Logging Start)
+# =====================================================
+
+spark.sql(f"""
+    INSERT INTO main.metadata.pipeline_runs 
+    VALUES ('{run_id}', {table_id}, 'Bronze', TIMESTAMP('{start_time}'), NULL, 'INPROGRESS', NULL, NULL)
+""")
+
+# COMMAND ----------
+# =====================================================
+# 4️⃣ Get Last Watermark
+# =====================================================
+last_watermark = "1900-01-01 00:00:00"
+watermark_df = spark.sql(f"SELECT last_watermark_value FROM main.metadata.table_watermarks WHERE table_id = {table_id}")
+
+if watermark_df.count() > 0:
+    retrieved_watermark = watermark_df.first()["last_watermark_value"]
+    # Handle cases where 'None' string is stored instead of a valid timestamp
+    if retrieved_watermark and retrieved_watermark != 'None':
+        last_watermark = retrieved_watermark
+
+print(f"Filtering source for data newer than: {last_watermark}")
+# COMMAND ----------
+# =====================================================
+# 5️⃣ Read Source Data from CSV Files
+# =====================================================
+
+def get_source_data(table_id, watermark_val, watermark_col):
+    """Reads data from CSV files in banking_project."""
+    
+    # Get source table info from metadata
+    metadata_df = spark.sql(f"SELECT source_table FROM banking.metadata.tables WHERE table_id = {table_id}")
+    source_table = metadata_df.first()["source_table"]
+    
+    # Handle file name mismatch (customers -> customer.csv)
+    file_mapping = {
+        "customers": "customer.csv",
+        "accounts": "accounts.csv",
+        "transactions": "transaction.csv",
+        "branches": "branches.csv"
+    }
+    csv_file = file_mapping.get(source_table, f"{source_table}.csv")
+    
+    # Construct CSV file path using the actual file name
+    csv_path = f"file:/Workspace/Users/msruthi.2376@gmail.com/metapipeline/banking_project/00_csv files/{csv_file}"
+    
+    print(f"Reading from: {csv_path}")
+    
+    # Define schema based on source table type
+    # accounts.csv has no header row - define explicit schema
+    if source_table == "accounts":
+        schema = StructType([
+            StructField("account_id", StringType(), True),
+            StructField("customer_id", IntegerType(), True),
+            StructField("branch_id", StringType(), True),
+            StructField("account_type", StringType(), True),
+            StructField("balance", StringType(), True),
+            StructField("currency", StringType(), True),
+            StructField("status", StringType(), True),
+            StructField("created_date", StringType(), True),
+            StructField("created_at", StringType(), True),
+            StructField("updated_at", StringType(), True)
+        ])
+        df = spark.read.format("csv").option("header", "false").schema(schema).load(csv_path)
+    else:
+        # For other tables, assume they have headers
+        df = spark.read.format("csv").option("header", "true").option("inferSchema", "true").load(csv_path)
+    
+    # Apply watermark filter if watermark column exists and has data
+    if watermark_col and watermark_col in df.columns:
+        print(f"Applying watermark filter: {watermark_col} > '{watermark_val}'")
+        # Convert string timestamp column to timestamp type for comparison
+        df = df.withColumn(watermark_col, to_timestamp(col(watermark_col))).filter(col(watermark_col) > lit(watermark_val))
+    else:
+        print(f"No watermark filtering applied (column: {watermark_col})")
+    
+    return df
+
+# Read source data with watermark filtering
+source_df = get_source_data(table_id, last_watermark, watermark_column)
+
+print(f"Source records fetched: {source_df.count()}")
+display(source_df)
+# COMMAND ----------
+# =====================================================
+# 6️⃣ Execution: Read → Write to Bronze
+# =====================================================
+
+try:
+    # Get bronze table schema to match columns
+    bronze_schema = spark.table(bronze_table_fqn).schema
+    bronze_columns = [field.name for field in bronze_schema.fields if field.name != "insert_timestamp"]
+    
+    # Select and transform source columns to match bronze schema
+    source_df = source_df.select(*[col(c) if c in source_df.columns else lit(None).alias(c) for c in bronze_columns]) \
+                         .withColumn("updated_at", col("updated_at").cast("string")) \
+                         .withColumn("insert_timestamp", current_timestamp())
+    
+    records_count = source_df.count()
+    print(f"Extracted {records_count} new records.")
+
+    # Write to Bronze (Delta)
+    source_df.write.format("delta").mode("append").saveAsTable(bronze_table_fqn)
+
+    # Update Audit to SUCCESS
+    end_time = spark.sql("SELECT current_timestamp()").collect()[0][0]
+    spark.sql(f"""
+        UPDATE main.metadata.pipeline_runs 
+        SET end_time = TIMESTAMP('{end_time}'), status = 'SUCCESS', number_of_records = {records_count}
+        WHERE run_id = '{run_id}' AND table_id = {table_id}
+    """)
+    
+    # Update Watermark (Simulating progression)
+    if records_count > 0:
+        new_watermark = source_df.agg({"updated_at": "max"}).collect()[0][0]
+        spark.sql(f"DELETE FROM main.metadata.table_watermarks WHERE table_id = {table_id}")
+        spark.sql(f"INSERT INTO main.metadata.table_watermarks VALUES ({table_id}, '{new_watermark}')")
+
+    print("✅ Process completed successfully.")
+
+except Exception as e:
+    error_msg = str(e)[:500].replace("'", "")
+    spark.sql(f"""
+        UPDATE main.metadata.pipeline_runs 
+        SET status = 'FAILED', error_message = '{error_msg}'
+        WHERE run_id = '{run_id}' AND table_id = {table_id}
+    """)
+    raise e
+%sql
+select * from banking.metadata.pipeline_runs order by start_time desc
+from pyspark.sql.functions import current_timestamp
+
+# =====================================================
+# 0️⃣ Initialize Variables
+# =====================================================
+source_system = "blob"
+table_name = "transactions"  
+source_path = "/Volumes/banking/source/volume/raw_landing/"  
+bronze_table_fqn = f"banking.bronze.{table_name}"  
+
+# =====================================================
+# 1️⃣ Ingest Source Stream
+# =====================================================
+if source_system == "blob":
+    source_df = (
+        spark.readStream
+        .format("cloudFiles")
+        .option("cloudFiles.format", "csv")
+        .option(
+            "cloudFiles.schemaLocation",
+            f"/Volumes/banking/source/volume/_schema/{table_name}"
+        )
+        .option("header", "true")
+        .load(source_path)
+    )
+else:
+    raise ValueError(f"Unsupported source_system: {source_system}")
+
+# =====================================================
+# 4️⃣ Select only transaction columns
+# =====================================================
+transaction_columns = [
+    "account_id", "amount", "balance_after", "created_at", "description",
+    "merchant", "transaction_date", "transaction_id", "transaction_time",
+    "transaction_type", "updated_at", "_rescued_data"
+]
+source_df = source_df.select(*transaction_columns)
+
+# =====================================================
+# 5️⃣ Add ingestion_timestamp
+# =====================================================
+source_df = source_df.withColumn("ingestion_timestamp", current_timestamp())
+
+# =====================================================
+# 6️⃣ Write to Bronze (Append Only)
+# =====================================================
+if source_system == "blob":
+    query = (
+        source_df.writeStream
+        .format("delta")
+        .option(
+            "checkpointLocation",
+            f"/Volumes/banking/source/volume/_checkpoints/{table_name}"
+        )            
+        .outputMode("append")
+        .trigger(availableNow=True)
+        .toTable(bronze_table_fqn)
+    )
+    
+    query.awaitTermination()
+    records_read = None
